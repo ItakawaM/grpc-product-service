@@ -1,0 +1,124 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# https://docs.coderabbit.ai/guides/configure-coderabbit
+language: "en-US"
+early_access: false
+
+chat:
+  auto_reply: true
+
+tone_instructions: >-
+  You are an expert Go and gRPC reviewer with a web background. 
+  Reply formal, concise: flag issues, give production-grade fixes, no praise or diff
+  restatement.
+
+reviews:
+  profile: chill
+  high_level_summary_instructions: >-
+    Write a concise summary for reviewers.
+        1. Start with a 1-2 sentence executive summary of the business or technical goal.
+        2. Group the technical changes into bulleted categories: Features, Fixes, Refactoring, and Chores.
+        3. Also explicitly flag: wire-breaking protobuf changes (field number reuse or renumbering, type changes, removed fields without `reserved`, edits to an already-released vN package); new, removed, or renamed RPCs and streaming-mode changes; changes to gRPC status-code mapping, interceptor chain, or auth; any use of insecure transport credentials; and bumps to the go.mod `go` directive or pinned tool versions (buf, protoc plugins, golangci-lint).
+        4. Do NOT list file-by-file changes (the walkthrough covers that). Keep it high-level.
+  high_level_summary_in_walkthrough: true
+
+  poem: false
+
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  enable_prompt_for_ai_agents: false
+
+  path_instructions:
+    - path: "**/*.go"
+      instructions: |
+        Review this Go code for correctness, idiomatic style, security, and performance. Target toolchain is Go 1.27.x (assume `go 1.27` in go.mod). Specifically:
+        - Flag unhandled or silently discarded errors (`_ = err`, ignored return values); prefer wrapping with `fmt.Errorf("...: %w", err)` over swallowing or re-stringifying
+        - Prefer sentinel/typed errors with `errors.Is` and `errors.AsType[T]` (1.26+) over `errors.As` with a pre-declared variable or string-matching error messages
+        - Check goroutines for leaks: every goroutine needs a clear exit path (context cancellation, closed channel, or WaitGroup); prefer `sync.WaitGroup.Go` over manual Add/Done; use `context.WithCancelCause`/`context.AfterFunc` where they simplify cancellation
+        - Prefer explicit, readable error handling and clean-code expressiveness over clever abstractions that obscure control flow
+        - Check exported functions/types have doc comments starting with the identifier name (godoc convention)
+        - Note allocations or patterns in hot paths that hurt performance (unnecessary copies, string concatenation in loops, missing `sync.Pool` where warranted)
+
+        Modern Go (suggest only when it simplifies the code; do not demand churn on unrelated lines):
+        - `for i := range n`, `min`/`max`/`clear` builtins, and `slices`/`maps`/`cmp` helpers (`slices.Sorted(maps.Keys(m))`, `slices.Collect`, `cmp.Or`, `strings.SplitSeq`/`FieldsSeq`) instead of hand-written loops
+        - `new(expr)` (1.26+) instead of throwaway pointer helpers or temporaries, notably for optional proto3 fields
+        - Typed atomics (`atomic.Int64`, etc.) instead of `atomic.AddInt64` on raw integers; `sync.OnceValue(s)` instead of hand-rolled once+variable
+        - `log/slog` for structured logging instead of `log.Printf`/`fmt.Println` or package loggers
+        - Generic methods (1.27) are valid; suggest them only where they remove real duplication, never for speculative abstraction
+        - `encoding/json` is v2-backed in 1.27: prefer the `omitzero` tag where zero-value omission is intended; flag reliance on undocumented decoding quirks
+        - Prefer the standard-library `uuid` package over third-party UUID packages in new code
+        - Pin dev tools (buf, protoc-gen-go, protoc-gen-go-grpc, golangci-lint) with `tool` directives in go.mod, not tools.go or `@latest`
+        - Do not use stdlib symbols newer than the go.mod `go` directive (`stdversion` vet check); if code matches patterns that `go fix` modernizers rewrite, say so
+
+    - path: "**/*.go"
+      instructions: |
+        gRPC checks. Apply only to files importing google.golang.org/grpc or generated service stubs.
+
+        Server handlers:
+        - Never return plain errors from handlers (clients see `codes.Unknown`); return `status.Error`/`status.Errorf` with the correct code (InvalidArgument vs FailedPrecondition/OutOfRange, NotFound, AlreadyExists, Unauthenticated vs PermissionDenied, ResourceExhausted; Unavailable only when retryable). Map domain errors to codes in one place
+        - Do not leak internal details (SQL, stack traces, file paths, key material) in status messages; attach `errdetails` (BadRequest, ErrorInfo) for structured errors
+        - Validate requests at the boundary (prefer protovalidate/`buf.validate` rules); use generated getters or nil-check nested messages; handle optional-field presence explicitly
+        - Honor `ctx`: pass it to all downstream I/O, check `ctx.Err()` in loops, never use `context.Background()` inside a handler
+        - Keep handlers thin: convert proto <-> domain types and delegate; no business logic or SQL in handlers
+        - Embed `Unimplemented<Service>Server` by value, not by pointer
+
+        Streaming:
+        - Stop on `stream.Context().Done()`; treat `io.EOF` from `Recv` as normal end of stream
+        - `SendMsg`/`RecvMsg` must not be called concurrently from multiple goroutines on the same stream (one sender, one receiver at most); no goroutine may outlive the RPC; no unbounded buffering
+        - Prefer unary + pagination unless streaming is justified
+
+        Server setup:
+        - Use `grpc.ChainUnaryInterceptor`/`ChainStreamInterceptor` (recovery -> tracing/logging -> auth -> validation); flag unary interceptors lacking a stream counterpart where one is needed
+        - Set explicit limits (`MaxRecvMsgSize`, keepalive params and enforcement policy); register `grpc_health_v1`; reflection only in non-production
+        - Shutdown via `GracefulStop` with a timeout fallback to `Stop`; treat `grpc.ErrServerStopped` from `Serve` as normal
+        - TLS/mTLS credentials by default; `insecure.NewCredentials()` only in clearly marked local/test code
+
+        Clients:
+        - Use `grpc.NewClient`, not deprecated `Dial`/`DialContext`, `WithBlock`, or `WithInsecure`; create one `ClientConn`, reuse it, and always `Close` it
+        - Every RPC needs a deadline (`context.WithTimeout`); retry only idempotent methods, via service-config retry policy
+        - Inspect errors with `status.FromError`/`status.Code`, never by string-matching `err.Error()`
+        - Metadata keys must be lowercase; auth tokens only over TLS
+
+        Observability: prefer otelgrpc stats handlers (`grpc.StatsHandler`) over deprecated interceptors; never log full request/response messages that may carry secrets or keys.
+
+    - path: "**/*.proto"
+      instructions: |
+        Review this Protocol Buffers file against Buf STANDARD lint rules, Google's API Improvement Proposals (AIP), and wire compatibility. Treat compatibility violations as high severity:
+        - Directory must match package (`productinfo.v1` in proto/productinfo/v1/); flag edits that break an already-released vN package and require a new vN+1 package instead. Do not hand-set `go_package` if buf managed mode is enabled
+        - Never reuse or renumber field numbers, change a field's type or cardinality, or renumber enum values. Removed fields need `reserved` for both number and name; deprecate with `[deprecated = true]` before removal
+        - Enums: first value must be `<ENUM_NAME>_UNSPECIFIED = 0`, with value names prefixed by the enum name
+        - Each RPC gets its own `<Rpc>Request`/`<Rpc>Response` messages; do not reuse entity messages or `google.protobuf.Empty` as RPC types
+        - Follow AIP-style method names (Get/List/Create/Update/Delete); List uses `page_size`/`page_token`/`next_page_token`; Update uses `google.protobuf.FieldMask`; use `optional` where presence matters; avoid wrapper types
+        - Streaming RPCs need a documented justification
+        - Use `google.protobuf.Timestamp`/`Duration`, not epoch integers or strings; use opaque string identifiers or resource names rather than leaking internal database IDs
+        - Reserve field numbers 1-15 for frequently set fields
+        - Mark sensitive fields with `[debug_redact = true]`; never design messages that require logging secret/key material
+        - Prefer `buf.validate` constraints (lengths, ranges, required) over unchecked free-form fields, and bound `repeated`/`map`/`bytes` sizes (default message limit is 4 MiB)
+        - Every service, RPC, message, and enum value needs a doc comment.
+
+    - path: "**/*_test.go"
+      instructions: |
+        Review this Go test code. Specifically:
+        - Use `t.Context()` (1.24+) instead of `context.Background()` plus manual cancel, `b.Loop()` for benchmarks, and `t.Cleanup` for teardown; use table-driven tests with `t.Run`, and `t.Parallel()` where safe
+        - Time-dependent logic should use `testing/synctest` (including `synctest.Sleep` in 1.27) instead of real sleeps or flaky timeouts
+        - gRPC tests: use `bufconn` for in-memory servers with `grpc.NewClient("passthrough:///bufnet", grpc.WithContextDialer(...))`; assert on `status.Code(err)`, not error strings; cover deadline-exceeded, cancellation, and early-termination paths; for streams, verify end-of-stream handling and that goroutines exit
+        - Tests should pass under `-race`; flag shared mutable state across parallel subtests
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: false
+
+  tools:
+    languagetool:
+      enabled: true
+      level: default
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
