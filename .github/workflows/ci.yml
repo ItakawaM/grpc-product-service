@@ -77,4 +77,4 @@ jobs:
       - name: Buf build, lint, format & breaking
         uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
         with:
-          version: "v1.74.0"
+          version: "1.74.0"
